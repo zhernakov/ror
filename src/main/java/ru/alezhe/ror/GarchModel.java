@@ -6,9 +6,12 @@
 package ru.alezhe.ror;
 
 import java.util.Arrays;
+import java.util.Collections;
+import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.stream.DoubleStream;
+import javafx.print.Collation;
 import org.apache.commons.math3.analysis.MultivariateFunction;
 import org.apache.commons.math3.distribution.NormalDistribution;
 import org.apache.commons.math3.exception.MathIllegalStateException;
@@ -84,19 +87,19 @@ public class GarchModel {
     }
 
     //////////////////////////
-    public class GarchApproximation {
+    public class Approximation {
 
         private final double omega;
         private final double[] aa;
         private final double[] bb;
 
-        public GarchApproximation(double omega, double[] aa, double[] bb) {
+        public Approximation(double omega, double[] aa, double[] bb) {
             this.omega = omega;
             this.aa = aa;
             this.bb = bb;
         }
 
-        public GarchApproximation(double[] param) {
+        public Approximation(double[] param) {
             this(
                     param[0],
                     Arrays.copyOfRange(param, 1, p + 1),
@@ -130,13 +133,13 @@ public class GarchModel {
 
     public class GarchApproximatedTimeSeries extends ObservedTimeSeries {
 
-        protected final GarchApproximation[] approximations;
+        protected final Approximation[] approximations;
         protected final double[][] variances;
         private final int windowSize;
 
         protected GarchApproximatedTimeSeries(ObservedTimeSeries series, int windowSize) {
             super(series);
-            this.approximations = new GarchApproximation[n];
+            this.approximations = new Approximation[n];
             this.variances = new double[n][];
             this.variances[0] = new double[q];
             Arrays.fill(variances[0], VARIANCE.evaluate(values));
@@ -145,13 +148,12 @@ public class GarchModel {
 
         protected void approximate() {
             for (int i = 1; i < n; i++) {
-                approximateAtTimePoint(i);
+                approximateVarAtTimePoint(i);
             }
         }
 
-        final 
-        protected void approximateAtTimePoint(int timePoint) {
-            GarchApproximation aprx = fitGarchParameters(timePoint);
+        final protected void approximateVarAtTimePoint(int timePoint) {
+            Approximation aprx = fitGarchParameters(timePoint);
             if (aprx == null) {
                 aprx = approximations[timePoint - 1];
                 System.err.println("failed to optimize at timepoint " + timePoint);
@@ -166,7 +168,7 @@ public class GarchModel {
             }
         }
 
-        private double[] calcVariances(GarchApproximation aprx, int timePoint) {
+        private double[] calcVariances(Approximation aprx, int timePoint) {
             final int realWindowSize = Math.min(windowSize, timePoint);
             final int first = timePoint - realWindowSize;
             final double[] vars = new double[realWindowSize + q];
@@ -177,7 +179,7 @@ public class GarchModel {
             return vars;
         }
 
-        private GarchApproximation fitGarchParameters(int i) {
+        private Approximation fitGarchParameters(int i) {
             MultivariateOptimizer optimizer = new BOBYQAOptimizer((p + q + 1) * 1 + (2));
             GarchMaxLikelihoodFunction lmfun = new GarchMaxLikelihoodFunction(i);
             try {
@@ -191,7 +193,7 @@ public class GarchModel {
                         new LinearConstraintSet(constraint)
                 );
                 double[] param = optResult.getPoint();
-                GarchApproximation apr = new GarchApproximation(param);
+                Approximation apr = new Approximation(param);
                 return apr;
             } catch (MathIllegalStateException e) {
                 return null;
@@ -200,7 +202,7 @@ public class GarchModel {
 
         ////////////////////////
         public double getVariance(int timePoint) {
-            GarchApproximation apr = approximations[timePoint];
+            Approximation apr = approximations[timePoint];
             return apr.getVariance(timePoint, values, q, variances[timePoint]);
         }
 
@@ -221,7 +223,7 @@ public class GarchModel {
 
             @Override
             public double value(double[] params) {
-                final GarchApproximation apr = new GarchApproximation(params);
+                final Approximation apr = new Approximation(params);
                 final double[] vars = calcVariances(apr, timePoint);
                 final int realWindowSize = Math.min(windowSize, timePoint);
                 final int first = timePoint - realWindowSize;
@@ -238,58 +240,68 @@ public class GarchModel {
     }
 
     public class MarGarchApproximatedTimeSeries extends GarchApproximatedTimeSeries {
+
         private final double confidence;
-        private final GarchApproximation[] marApproximations;
+        private double quantile;
+        private final Approximation[] marApproximations;
         private final double[][] marVariances;
-        
+
         private final Map<double[],double[]> failsHistory = new LinkedHashMap<>();
-        
+
+        private Integer failPoint;
+
         private MarGarchApproximatedTimeSeries(ObservedTimeSeries series, int windowSize, double confidence) {
             super(series, windowSize);
             this.confidence = confidence;
-            this.marApproximations = new GarchApproximation[n + 1];
+            this.quantile = NID.inverseCumulativeProbability(1 - confidence);
+            this.marApproximations = new Approximation[n + 1];
             this.marVariances = new double[n + 1][];
-            
+
             this.marVariances[0] = variances[0];
         }
 
         @Override
         protected void approximate() {
             for (int i = 1; i < n; i++) {
-                approximateAtTimePoint(i);
-                
+                approximateVarAtTimePoint(i);
+                approximateMarAtTimePoint(i);
+
                 double var = getVaR(i, confidence);
                 boolean failed = values[i] < var;
                 if (failed) {
-                    if (i == 1) {
-                        throw new UnsupportedOperationException("we have not been ready to first fall!!!");
-                    }
-                    addToFailsHistory(i);
-                    GarchApproximation apr = calculateApproximation();
-                    if (apr == null) {
-                        apr = marApproximations[i];
-                        System.err.println("failed to optimize MaR at timepoint " + i);
-                    }
-                    marApproximations[i + 1] = apr;
-                } else {
-                    if (marApproximations[i] == null) {
-                        marApproximations[i] = approximations[i];
-                        marVariances[i] = variances[i];
-                    }
-                    marApproximations[i + 1] = marApproximations[i];
+                    failPoint = i;
                 }
-                marVariances[i + 1] = calcMarVariances(marApproximations[i + 1], i + 1);
             }
+        }
+
+        private void approximateMarAtTimePoint(int i) {
+            if (failPoint == null) {
+                if (marApproximations[i - 1] == null) {
+                    marApproximations[i - 1] = approximations[i];
+                    marVariances[i - 1] = variances[i - 1];
+                }
+                marApproximations[i] = marApproximations[i - 1];
+            } else {
+                addToFailsHistory(failPoint);
+                Approximation apr = calculateApproximation();
+                if (apr == null) {
+                    apr = marApproximations[i - 1];
+                    System.err.println("failed to optimize MaR at timepoint " + i);
+                }
+                marApproximations[i] = apr;
+                failPoint = null;
+            }
+            marVariances[i] = calcMarVariances(marApproximations[i], i);
         }
 
         private void addToFailsHistory(int timePoint) {
             double[] vals = Arrays.copyOfRange(values, timePoint - p + 1, timePoint + 1);
-            double[] vars = marVariances[timePoint];
-            
+            double[] vars = marVariances[timePoint  ];
+
             failsHistory.put(vals, vars);
         }
 
-        protected double[] calcMarVariances(GarchApproximation apr, int timePoint) {
+        protected double[] calcMarVariances(Approximation apr, int timePoint) {
             final int realSize = Math.min(q, timePoint);
             final int first = timePoint - realSize;
             final double[] vars = new double[realSize + q];
@@ -299,8 +311,8 @@ public class GarchModel {
             }
             return Arrays.copyOfRange(vars, realSize, realSize + q);
         }
-        
-        private GarchApproximation calculateApproximation() {
+
+        private Approximation calculateApproximation() {
             MultivariateOptimizer optimizer = new BOBYQAOptimizer((p + q + 1) * 1 + (2));
             MarGarchMaxLikelihoodFunction lmfun = new MarGarchMaxLikelihoodFunction();
             try {
@@ -314,7 +326,7 @@ public class GarchModel {
                         new LinearConstraintSet(constraint)
                 );
                 double[] param = optResult.getPoint();
-                GarchApproximation apr = new GarchApproximation(param);
+                Approximation apr = new Approximation(param);
                 return apr;
             } catch (MathIllegalStateException e) {
                 return null;
@@ -322,10 +334,9 @@ public class GarchModel {
         }
 
         double getMaR(int timePoint) {
-            GarchApproximation apr = marApproximations[timePoint];
-            double variance = apr.getVariance(timePoint, values, q, marVariances[timePoint]);
-            
-            double quantile = NID.inverseCumulativeProbability(1 - confidence);
+            Approximation apr = marApproximations[timePoint];
+            double variance = apr.getVariance(timePoint, values, q, variances[timePoint]);
+
             return quantile * Math.sqrt(variance);
         }
 
@@ -333,8 +344,8 @@ public class GarchModel {
 
             @Override
             public double value(double[] params) {
-                final GarchApproximation apr = new GarchApproximation(params);
-                
+                final Approximation apr = new Approximation(params);
+
                 double lml = 0;
                 for (Map.Entry<double[], double[]> entry : failsHistory.entrySet()) {
                     double[] vals = entry.getKey();
@@ -345,9 +356,9 @@ public class GarchModel {
                 }
                 return lml;
             }
-            
+
         }
-        
+
     }
     //////////////////////////
     //////////////////////////
